@@ -1,53 +1,42 @@
-# Boundary Cricket
+# WicketX — cricket scores prototype (web + Android)
 
-An original indigo-and-lime cricket website and bundled Android prototype. Not affiliated with Cricbuzz, the ICC or any cricket board. No Cricbuzz code, branding, news, photos or commentary is included.
+Cricbuzz-style cricket companion with original vintage design, branding and content.
+Live web app: https://wicketx.appwrite.network/
 
 ## Status
+- Web app: React + TypeScript + Vite (single-file build), hosted on Appwrite Sites (Free plan).
+- Android: Capacitor wrapper, app id in.adityapandey.wicketx, debug APK compiles (runtime unverified: no emulator available).
+- Backend: Appwrite Cloud (Free plan, region FRA), project "WicketX".
+- All scores, fixtures, stories and rankings are illustrative demo data until a licensed provider is chosen.
 
-This is a working **demo**, not a production live-score service. Every score, fixture, ranking and squad is illustrative. Stories are original evergreen explainers, not live news. No data provider is connected. No paid service has been enabled.
+## Backend (Appwrite)
+- Database `wicketx`
+  - Table `matches`: demo match documents (`payload` JSON string, `dataMode` string). Permission: read for anyone; no client writes.
+  - Table `saved_matches`: per-user saved matches (`matchId` string). Row security ON; create for signed-in users only; each row carries user-scoped read/delete permissions, so users can only see and remove their own saves.
+- Auth: email + password, optional. Everything is browsable as a guest; an account is only needed to sync saved matches across devices.
+- Client config is public (endpoint, project id, database id) and lives in `.env` — see `.env.example`.
+- Verified by a live two-account permission test (`scripts/appwrite-test.cjs`): anonymous reads allowed, anonymous writes rejected, cross-user read/delete rejected.
 
-Included: responsive home, match filters and search, match details, one detailed sample scorecard/commentary/squad, schedules, sample rankings, stories, device-local saved matches and light/dark theme. No authentication, payments, notifications, video streaming or cloud sync.
+## Local development
+1. `npm install`
+2. Copy `.env.example` to `.env` (values are public client config).
+3. `npm run dev`, then open http://localhost:5173
 
-## Run locally
+## Tests and build
+- `npx playwright test` — 6 tests covering layout, routing and the optional-account flow.
+- `npm run build` — production build into `dist/`.
+- Android: `npx cap sync android`, then `cd android && JAVA_HOME=/home/sandbox/jdk ./gradlew assembleDebug` (needs JDK 17+; system default is Java 11).
 
-Node 22.12+ is required.
+## Deploy (Appwrite Sites)
+Manual static deploy of `dist/`: create site, upload `tar.gz` of the dist contents, framework React with install/build commands cleared and output directory `./`. Add the site hostname as a Web platform in the project so the API accepts its requests.
 
-```sh
-npm ci
-npm run dev
-npm test
-npm run build
-```
+## Repository artifacts
+- `1-5-WicketX-source-appwrite.zip` — full source with Appwrite integration (supersedes `1-WicketX-source.zip`).
+- `2-6-WicketX-preview.html` — built web app preview from `dist/index.html` (supersedes `2-WicketX-preview.html`).
+- `3-7-WicketX-demo-debug.apk` — Android debug build with backend config (supersedes `3-WicketX-demo-debug.apk`).
+- `3-README.md` — this file.
 
-Browser tests use `/usr/bin/google-chrome` by default; edit `playwright.config.ts` for another Chrome executable. Tests cover navigation, filtering, search, saved/theme persistence and overflow checks at 320, 390, 768 and 1440 px.
+Older `Boundary-*` files are superseded checkpoints from before the rename.
 
-## Android
-
-The `android/` project uses Capacitor. Web assets are bundled in the APK, not loaded from a remote site. Use JDK 21 and Android SDK 36.
-
-```sh
-npm run android:sync
-cd android
-./gradlew assembleDebug --no-daemon --max-workers=1
-```
-
-The debug APK is for testing only. It is not a Play Store release. A release needs a user-controlled signing key, actual-device testing, a privacy/data policy review and distribution decisions. Keep keystores and credentials out of git. Existing release signing keys must go through a secure secret store.
-
-## Data and next steps
-
-Before real scores are enabled, choose a provider that explicitly permits the intended display/redistribution and commercial or non-commercial use. Confirm coverage, delay, quota and attribution. Store the key server-side only. Never bundle it in the website or Android app.
-
-CricketData was reviewed as an option, not integrated. Its pricing page states 100 free requests/day; terms limit commercial use. That is not sufficient evidence for a free public commercial real-time product.
-
-- https://cricketdata.org/pricing/
-- https://cricketdata.org/terms-of-use/
-
-A production architecture should fetch and cache centrally, enforce a shared daily request cap, mark stale scores, and return explicit provider errors. Do not label cached or demo data as live. No Supabase project is required for the current demo. A future cloud-synced service can use a separate approved database.
-
-## Privacy
-
-Saved matches and theme are stored in localStorage on the device. No analytics, account or personal data collection is included. Fonts are bundled locally with their open font licenses. No external font requests are required.
-
-## Verification record
-
-The web build and all five Playwright test groups passed locally. Npm audit reported zero vulnerabilities at handoff. Android debug build succeeded. Android runtime testing remains blocked: no hardware acceleration and insufficient free RAM for the software emulator in the build environment. Do not describe the APK as runtime-tested or production-ready.
+## Legal
+Independent prototype. Not affiliated with Cricbuzz or any cricket board. No Cricbuzz assets, copy or data.
