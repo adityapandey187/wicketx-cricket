@@ -705,6 +705,269 @@ async def scorecard(match_id: str):
     return JSONResponse(content={"success": True, "stale": stale, "last_updated": iso(fetched), **data})
 
 
+
+# WicketX factual cricket data extension. Never return prose, media or raw pages.
+EXT_TTL = 600
+_ext_fetch_lock = asyncio.Lock()
+_ext_last_fetch = 0.0
+
+def all_values(text: str, key: str):
+    marker = json.dumps(key) + ':'
+    start = 0
+    while True:
+        pos = text.find(marker, start)
+        if pos < 0:
+            break
+        pos += len(marker)
+        try:
+            value, end = decode_at(text, pos)
+            yield value
+            start = end
+        except ValueError:
+            start = pos
+
+def only_fields(item, fields):
+    return {k: v for k, v in item.items() if k in fields and v != '$undefined'}
+
+async def ext_fetch(path: str, as_json=False):
+    global _ext_last_fetch
+    # All new uncached requests are serialized with a minimum three-second gap.
+    async with _ext_fetch_lock:
+        await asyncio.sleep(max(0, 3 - (time.monotonic() - _ext_last_fetch)))
+        _ext_last_fetch = time.monotonic()
+        if _state.get('upstream_blocked'):
+            raise ScrapeError('Source refresh paused after a block')
+        response = await _state['client'].get(BASE + path, headers=browser_headers())
+        if response.status_code in (403, 429):
+            _state['upstream_blocked'] = True
+            raise ScrapeError('Source refresh paused after a block')
+        if response.status_code != 200:
+            raise ScrapeError('Source not available')
+        return response.json() if as_json else response.text
+
+async def ext_text(path):
+    return flight_text(await ext_fetch(path))
+
+async def ext_response(key, loader, ttl=EXT_TTL):
+    try:
+        data, fetched, stale = await cache.get('ext:' + key, ttl, loader)
+        return JSONResponse(content={'success': True, 'stale': stale, 'last_updated': iso(fetched), **data})
+    except Exception as exc:
+        log.warning('extension source unavailable %s: %s', key, exc)
+        return JSONResponse(status_code=503, content={'success': False, 'stale': False, 'error': 'Cricket data is not available from the source right now. Try again later.'})
+
+def numeric(value):
+    return bool(re.fullmatch(r'\d{1,10}', str(value)))
+
+def ext_matches(text, series_id=None):
+    items = []
+    try:
+        entries = extract_matches(text).values()
+    except ScrapeError:
+        return []
+    for entry in entries:
+        if series_id is not None and str(entry['info'].get('seriesId')) != str(series_id):
+            continue
+        item = build_match(entry)
+        info = entry['info']
+        item['series_id'] = str(info.get('seriesId') or '')
+        for key, team_key in [('team_a', 'team1'), ('team_b', 'team2')]:
+            item[key]['id'] = str((info.get(team_key) or {}).get('teamId') or '')
+        items.append(item)
+    return sort_matches(items)
+
+async def load_rankings(gender, category):
+    text = await ext_text(f'/cricket-stats/icc-rankings/{gender}/{category}')
+    data = find_value(text, 'formatTypesData')
+    if not isinstance(data, dict):
+        raise ScrapeError('Rankings not published')
+    return {'gender': gender, 'category': category, 'formats': {fmt: [only_fields(row, {'id','rank','name','matches','rating','points','country','trend'}) for row in value.get('rank', [])] for fmt, value in data.items() if isinstance(value, dict)}}
+
+@app.get('/api/rankings/{gender}/{category}')
+async def extended_rankings(gender: Literal['men','women'], category: Literal['batting','bowling','all-rounder','teams']):
+    return await ext_response(f'rank:{gender}:{category}', lambda: load_rankings(gender,category), 1800)
+
+async def load_series_index():
+    text = await ext_text('/cricket-schedule/series')
+    groups = find_value(text, 'seriesScheduleData')
+    if not isinstance(groups, list):
+        raise ScrapeError('Series not published')
+    result = []
+    for group in groups:
+        for item in group.get('series', []):
+            result.append(only_fields(item, {'id','name','startDt','endDt'}))
+    result.sort(key=lambda s: (0 if 'india' in s.get('name','').lower() else 1, int(s.get('startDt') or 0)))
+    return {'series': result}
+
+@app.get('/api/series')
+async def extended_series():
+    return await ext_response('series', load_series_index, 1800)
+
+async def load_series_part(series_id, part, stat='mostRuns'):
+    if part == 'stats':
+        data = await ext_fetch(f'/api/cricket-series/series-stats/{series_id}?statsType={stat}', True)
+        # Only the numeric stats table is allowed out, never articles or images.
+        tables = {k: {'headers':v.get('headers',[]),'values':[{'values':r.get('values',[])} for r in v.get('values',[])]} for k, v in data.items() if k.endswith('StatsList') and isinstance(v, dict)}
+        if not tables:
+            text = await ext_text(f'/cricket-series/{series_id}/x/stats?statsType={stat}')
+            raw = find_value(text, 'initialStats') or {}
+            tables = {k:{'headers':v.get('headers',[]),'values':[{'values':r.get('values',[])} for r in v.get('values',[])]} for k,v in raw.items() if k.endswith('StatsList') and isinstance(v,dict)}
+        return {'series_id': series_id, 'stat': stat, 'tables': tables}
+    text = await ext_text(f'/cricket-series/{series_id}/x/{part}')
+    if part == 'matches':
+        return {'series_id': series_id, 'matches': ext_matches(text, series_id)}
+    if part == 'squads':
+        squads = find_value(text, 'squads') or []
+        return {'series_id': series_id, 'squads': [only_fields(row, {'squadId','squadType','teamId','isHeader'}) for row in squads]}
+    groups = find_value(text, 'pointsTable') or []
+    return {'series_id': series_id, 'groups': [{'name':g.get('groupName'), 'teams':[only_fields(row, {'teamFullName','teamName','teamId','matchesPlayed','matchesWon','matchesLost','matchesTied','noRes','matchesDrawn','nrr','points'}) for row in g.get('pointsTableInfo', [])]} for g in groups]}
+
+@app.get('/api/series/{series_id}/{part}')
+async def extended_series_part(series_id: str, part: Literal['matches','squads','points-table','stats'], stat: Literal['mostRuns','mostWickets']='mostRuns'):
+    if not numeric(series_id):
+        return JSONResponse(status_code=400,content={'success':False,'error':'Invalid series ID'})
+    return await ext_response(f'series:{series_id}:{part}:{stat}',lambda:load_series_part(series_id,part,stat))
+
+async def load_squad(series_id,squad_id):
+    data=await ext_fetch(f'/api/cricket-series/series-squads/{series_id}/{squad_id}',True)
+    return {'series_id':series_id,'squad_id':squad_id,'players':[only_fields(p,{'id','name','captain','keeper','role','battingStyle','bowlingStyle','isHeader'}) for p in data.get('player',[])]}
+
+@app.get('/api/series/{series_id}/squad/{squad_id}')
+async def extended_squad(series_id:str,squad_id:str):
+    if not numeric(series_id) or not numeric(squad_id):
+        return JSONResponse(status_code=400,content={'success':False,'error':'Invalid squad ID'})
+    return await ext_response(f'squad:{series_id}:{squad_id}',lambda:load_squad(series_id,squad_id))
+
+async def load_match_squads(match_id):
+    text=await ext_text(f'/cricket-match-squads/{match_id}/x')
+    teams=[]
+    for key in ['team1','team2']:
+        for row in all_values(text,key):
+            if not isinstance(row,dict) or not isinstance(row.get('players'),dict):
+                continue
+            team=row.get('team') or {}
+            teams.append({'id':team.get('teamId'),'name':team.get('teamName'),'groups':{group:[only_fields(p,{'id','name','captain','keeper','role','substitute','battingStyle','bowlingStyle'}) for p in players] for group,players in row['players'].items() if isinstance(players,list)}})
+            break
+    return {'match_id':match_id,'teams':teams}
+
+@app.get('/api/match/{match_id}/squads')
+async def extended_match_squads(match_id:str):
+    if not numeric(match_id):
+        return JSONResponse(status_code=400,content={'success':False,'error':'Invalid match ID'})
+    return await ext_response(f'match-squads:{match_id}',lambda:load_match_squads(match_id))
+
+def parse_ball_facts(data, match_id, innings):
+    balls=[]
+    for group in data.get('commentary',[]):
+        if int(group.get('inningsId') or 0)!=innings:
+            continue
+        for row in group.get('commentaryList',[]):
+            if not row.get('ballNbr') or row.get('overNumber') is None:
+                continue
+            bat=row.get('batsmanStriker') or {};bowl=row.get('bowlerStriker') or {}
+            event=str(row.get('event') or '').upper()
+            balls.append({'innings':innings,'ball':str(row['overNumber']),'ball_number':row['ballNbr'],'timestamp':row.get('timestamp'),'team':row.get('batTeamName'),'batsman':bat.get('batName'),'batsman_id':bat.get('batId'),'bowler':bowl.get('bowlName'),'bowler_id':bowl.get('bowlId'),'runs':row.get('totalRuns'),'bat_runs':row.get('legalRuns'),'score':row.get('batTeamScore'),'wicket':'WICKET' in event,'four':'FOUR' in event,'six':'SIX' in event,'batsman_stats':only_fields(bat,{'batId','batName','batRuns','batBalls','batFours','batSixes','batStrikeRate'}),'bowler_stats':only_fields(bowl,{'bowlId','bowlName','bowlOvs','bowlRuns','bowlWkts','bowlMaidens','bowlEcon'}),'over_summary':only_fields(row.get('overSeparator') or {},{'score','wickets','runs','overNum'})})
+    return {'match_id':match_id,'innings':innings,'balls':balls}
+
+async def load_ball_facts(match_id,innings):
+    data=await ext_fetch(f'/api/mcenter/{match_id}/full-commentary/{innings}',True)
+    if str(data.get('matchId'))!=match_id:
+        raise ScrapeError('Wrong match returned')
+    return parse_ball_facts(data,match_id,innings)
+
+@app.get('/api/match/{match_id}/balls')
+async def extended_balls(match_id:str,innings:int=Query(1,ge=1,le=4)):
+    if not numeric(match_id):
+        return JSONResponse(status_code=400,content={'success':False,'error':'Invalid match ID'})
+    return await ext_response(f'balls:{match_id}:{innings}',lambda:load_ball_facts(match_id,innings),60)
+
+async def load_extended_match(match_id):
+    text=await ext_text(f'/live-cricket-scores/{match_id}/x')
+    header=find_value(text,'matchHeader') or {}
+    mini=find_value(text,'miniscore')
+    if str(header.get('matchId'))!=match_id:
+        raise ScrapeError('Match details not available')
+    info={'matchId':int(match_id),'seriesId':header.get('seriesId'),'seriesName':header.get('seriesName'),'matchDesc':header.get('matchDescription'),'matchFormat':header.get('matchFormat'),'startDate':header.get('matchStartTimestamp'),'state':header.get('state'),'status':header.get('status'),'venueInfo':{'ground':(header.get('venue') or {}).get('name'),'city':(header.get('venue') or {}).get('city')}}
+    scores={}
+    for index,key in enumerate(['team1','team2']):
+        team=header.get(key) or {};tid=team.get('id')
+        info[key]={'teamId':tid,'teamName':team.get('name'),'teamSName':team.get('shortName')}
+        innings=[r for r in ((mini or {}).get('matchScoreDetails') or {}).get('inningsScoreList',[]) if r.get('batTeamId')==tid]
+        scores['team'+str(index+1)+'Score']={'inngs'+str(n+1):{'runs':r.get('score'),'wickets':r.get('wickets'),'overs':r.get('overs'),'isDeclared':r.get('isDeclared')} for n,r in enumerate(sorted(innings,key=lambda r:r.get('inningsId',0)))}
+    match=build_match({'info':info,'score':scores});match['series_id']=str(header.get('seriesId') or '')
+    return {'match_id':match_id,'match':match,'series_id':str(header.get('seriesId') or ''),'series':header.get('seriesName'),'status_text':header.get('status'),'current_state':build_current_state(mini) if isinstance(mini,dict) else None,'teams':[only_fields(header.get(k) or {},{'id','name','shortName'}) for k in ['team1','team2']]}
+
+@app.get('/api/match/{match_id}/details')
+async def extended_match(match_id:str):
+    if not numeric(match_id):
+        return JSONResponse(status_code=400,content={'success':False,'error':'Invalid match ID'})
+    return await ext_response(f'match-details:{match_id}',lambda:load_extended_match(match_id),60)
+
+async def load_player(player_id):
+    text=await ext_text(f'/profiles/{player_id}/x')
+    raw=find_value(text,'playerData') or {}
+    if str(raw.get('id'))!=player_id:
+        raise ScrapeError('Player not published')
+    allowed={'id','bat','bowl','name','fullName','height','role','birthPlace','intlTeam','teams','DoB','rankings','teamNameIds'}
+    tables={}
+    for name in ['battingStats','bowlingStats']:
+        table=find_value(text,name) or {}
+        tables[name]={'headers':table.get('headers',[]),'values':[{'values':r.get('values',[])} for r in table.get('values',[])]}
+    career=find_value(text,'playerCareerData') or {}
+    return {'player':only_fields(raw,allowed),'tables':tables,'career':[only_fields(row,{'name','debut','lastPlayed','debutMatchID','lastPlayedMatchId'}) for row in career.get('values',[])]}
+
+@app.get('/api/player/{player_id}')
+async def extended_player(player_id:str):
+    if not numeric(player_id):
+        return JSONResponse(status_code=400,content={'success':False,'error':'Invalid player ID'})
+    return await ext_response(f'player:{player_id}',lambda:load_player(player_id),3600)
+
+async def load_teams():
+    html=await ext_fetch('/cricket-team')
+    soup=BeautifulSoup(html,'lxml');teams={}
+    for anchor in soup.find_all('a',href=True):
+        match=re.fullmatch(r'/cricket-team/[^/]+/(\d+)',anchor['href'])
+        name=anchor.get_text(' ',strip=True)
+        if match and name:
+            teams[match.group(1)]={'teamId':match.group(1),'teamName':name}
+    return {'teams':sorted(teams.values(),key=lambda row:(0 if 'india' in row.get('teamName','').lower() else 1,row.get('teamName','')))}
+
+@app.get('/api/teams')
+async def extended_teams():
+    return await ext_response('teams',load_teams,3600)
+
+async def load_team_part(team_id,part):
+    html=await ext_fetch(f'/cricket-team/x/{team_id}/{part}')
+    if part=='players':
+        soup=BeautifulSoup(html,'lxml');players={}
+        for anchor in soup.find_all('a',href=True):
+            match=re.fullmatch(r'/profiles/(\d+)/[^/?]+',anchor['href'])
+            if match and anchor.get('title'):
+                players[match.group(1)]={'id':match.group(1),'name':anchor['title']}
+        return {'team_id':team_id,'players':list(players.values())}
+    text=flight_text(html)
+    raw=find_value(text,'teamMatchesData') or []
+    matches=[]
+    def walk(node):
+        if isinstance(node,dict):
+            if isinstance(node.get('matchInfo'),dict):
+                info=node['matchInfo']
+                if str((info.get('team1') or {}).get('teamId'))==team_id or str((info.get('team2') or {}).get('teamId'))==team_id:
+                    item=build_match({'info':info,'score':node.get('matchScore')});item['series_id']=str(info.get('seriesId') or '')
+                    matches.append(item)
+            else:
+                for v in node.values():walk(v)
+        elif isinstance(node,list):
+            for v in node:walk(v)
+    walk(raw)
+    return {'team_id':team_id,'matches':sort_matches(matches)}
+
+@app.get('/api/team/{team_id}/{part}')
+async def extended_team(team_id:str,part:Literal['schedule','results','players']):
+    if not numeric(team_id):
+        return JSONResponse(status_code=400,content={'success':False,'error':'Invalid team ID'})
+    return await ext_response(f'team:{team_id}:{part}',lambda:load_team_part(team_id,part))
+
 if __name__ == "__main__":
     import os
 
