@@ -33,12 +33,12 @@ URL_LIVE = BASE + "/cricket-match/live-scores"
 URL_RECENT = BASE + "/cricket-match/live-scores/recent-matches"
 URL_UPCOMING = BASE + "/cricket-match/live-scores/upcoming-matches"
 
-TTL_LIVE = 30          # seconds: live matches (and per-match live details)
+TTL_LIVE = 15          # seconds: live matches (and per-match live details)
 TTL_SCORECARD = 30     # seconds: scorecards
 TTL_OTHER = 300        # seconds: completed / upcoming lists
 
-MAX_DETAIL_MATCHES = 12      # live matches enriched with batsmen/bowler per list call
-BACKGROUND_INTERVAL = 30     # seconds between background refresh passes
+MAX_DETAIL_MATCHES = 5      # live matches enriched with batsmen/bowler per list call
+BACKGROUND_INTERVAL = 15     # seconds between background refresh passes
 ACTIVE_WINDOW = 180          # background refresh only if a client asked in the last N seconds
 
 USER_AGENTS = [
@@ -82,6 +82,7 @@ class TTLCache:
         self._locks: Dict[str, asyncio.Lock] = {}
         self._fail_count: Dict[str, int] = {}
         self._retry_after: Dict[str, float] = {}
+        self._refresh_tasks = {}
 
     def _lock(self, key: str) -> asyncio.Lock:
         if key not in self._locks:
@@ -96,12 +97,24 @@ class TTLCache:
         return item is not None and (time.time() - item[0]) < ttl
 
     async def get(
-        self, key: str, ttl: float, loader: Callable[[], Awaitable[Any]]
+        self, key: str, ttl: float, loader: Callable[[], Awaitable[Any]], swr: bool = False
     ) -> Tuple[Any, float, bool]:
         """Return (value, fetched_at, stale). Raises ScrapeError only if nothing is cached."""
         item = self._data.get(key)
         if item and (time.time() - item[0]) < ttl:
             return item[1], item[0], False
+        if swr and item:
+            # Return the last real result immediately; one task refreshes this key.
+            if key not in self._refresh_tasks and not _state.get("upstream_blocked") and time.time() >= self._retry_after.get(key, 0):
+                async def refresh():
+                    try:
+                        await self.get(key, ttl, loader, swr=False)
+                    except Exception:
+                        pass  # ordinary cache backoff handles failures
+                    finally:
+                        self._refresh_tasks.pop(key, None)
+                self._refresh_tasks[key] = asyncio.create_task(refresh())
+            return item[1], item[0], True
         async with self._lock(key):
             # Another request may have refreshed while we waited for the lock.
             item = self._data.get(key)
@@ -158,20 +171,47 @@ def browser_headers() -> Dict[str, str]:
     }
 
 
+_upstream_lock = asyncio.Lock()
+_upstream_last = 0.0
+
+async def upstream_get(url):
+    global _upstream_last
+    async with _upstream_lock:
+        if _state.get("upstream_blocked"):
+            raise ScrapeError("Source refresh paused after a block")
+        # All source traffic, including the old core loaders, shares this queue.
+        await asyncio.sleep(max(0, 3.0 + random.uniform(0, 0.35) - (time.monotonic() - _upstream_last)))
+        _upstream_last = time.monotonic()
+        try:
+            response = await _state["client"].get(url, headers=browser_headers())
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ScrapeError("upstream request failed") from exc
+        if response.status_code in (403, 429):
+            _state["upstream_blocked"] = True
+            raise ScrapeError("Source refresh paused after a block")
+        if response.status_code != 200:
+            raise ScrapeError("Source not available")
+        return response
+
 async def fetch_html(url: str) -> str:
-    client: httpx.AsyncClient = _state["client"]
-    if _state.get("upstream_blocked"):
-        raise ScrapeError("Source refresh paused after a block")
-    try:
-        resp = await client.get(url, headers=browser_headers())
-    except (httpx.TimeoutException, httpx.TransportError) as exc:
-        raise ScrapeError("upstream request failed") from exc
-    if resp.status_code in (403, 429):
-        _state["upstream_blocked"] = True
-        raise ScrapeError(f"HTTP {resp.status_code}: source refresh paused")
-    if resp.status_code != 200 or len(resp.text) < 5000:
-        raise ScrapeError(f"HTTP {resp.status_code}: upstream unavailable")
-    return resp.text
+    response = await upstream_get(url)
+    if len(response.text) < 5000:
+        raise ScrapeError("Source page not available")
+    return response.text
+
+
+def known_in_play(match_id):
+    for key in ["page:live", "page:recent", "page:upcoming"]:
+        item = cache.peek(key)
+        for match in (item[1] if item else []):
+            if str(match.get("id")) == str(match_id):
+                return match.get("status") == "live"
+    item = cache.peek("ext:match-details:" + str(match_id))
+    return bool(item and item[1].get("match", {}).get("status") == "live")
+
+def live_page_ttl():
+    item = cache.peek("page:live")
+    return TTL_LIVE if item and any(m.get("status") == "live" for m in item[1]) else 60
 
 
 
@@ -531,9 +571,9 @@ def sort_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 async def get_all_matches() -> Tuple[List[Dict[str, Any]], float, bool]:
     """Merge live page (15s TTL) with recent/upcoming pages (5 min TTL)."""
     results = await asyncio.gather(
-        cache.get("page:live", TTL_LIVE, lambda: load_page_matches(URL_LIVE)),
-        cache.get("page:recent", TTL_OTHER, lambda: load_page_matches(URL_RECENT)),
-        cache.get("page:upcoming", TTL_OTHER, lambda: load_page_matches(URL_UPCOMING)),
+        cache.get("page:live", live_page_ttl(), lambda: load_page_matches(URL_LIVE), swr=True),
+        cache.get("page:recent", TTL_OTHER, lambda: load_page_matches(URL_RECENT), swr=True),
+        cache.get("page:upcoming", TTL_OTHER, lambda: load_page_matches(URL_UPCOMING), swr=True),
         return_exceptions=True,
     )
     good = [r for r in results if not isinstance(r, BaseException)]
@@ -547,7 +587,7 @@ async def get_all_matches() -> Tuple[List[Dict[str, Any]], float, bool]:
         for m in r[0]:
             merged[m["id"]] = dict(m)
     stale = any(r[2] for r in good) or len(good) < len(results)
-    fetched = min(r[1] for r in good)
+    fetched = results[0][1] if not isinstance(results[0], BaseException) else min(r[1] for r in good)
     return list(merged.values()), fetched, stale
 
 
@@ -563,7 +603,7 @@ async def enrich_live(matches: List[Dict[str, Any]]) -> bool:
         async with sem:
             try:
                 state, _, stale = await cache.get(
-                    f"live:{m['id']}", TTL_LIVE, lambda: load_live_state(m["id"])
+                    f"live:{m['id']}", TTL_LIVE, lambda: load_live_state(m["id"]), swr=True
                 )
             except ScrapeError:
                 return
@@ -608,6 +648,9 @@ async def matches_response(category: str, status: str, details: bool) -> JSONRes
         "total": len(selected),
         "last_updated": iso(fetched),
         "matches": selected,
+        "updating": stale and not bool(_state.get("upstream_blocked")),
+        "upstream_paused": bool(_state.get("upstream_blocked")),
+        "live_cache_seconds": live_page_ttl(),
     })
 
 
@@ -620,9 +663,9 @@ async def background_refresher() -> None:
             await asyncio.sleep(BACKGROUND_INTERVAL)
             if time.time() - _state["last_request"] > ACTIVE_WINDOW:
                 continue  # nobody is using the API: save bandwidth, stay polite upstream
-            await cache.get("page:live", TTL_LIVE, lambda: load_page_matches(URL_LIVE))
-            await cache.get("page:recent", TTL_OTHER, lambda: load_page_matches(URL_RECENT))
-            await cache.get("page:upcoming", TTL_OTHER, lambda: load_page_matches(URL_UPCOMING))
+            await cache.get("page:live", live_page_ttl(), lambda: load_page_matches(URL_LIVE), swr=True)
+            await cache.get("page:recent", TTL_OTHER, lambda: load_page_matches(URL_RECENT), swr=True)
+            await cache.get("page:upcoming", TTL_OTHER, lambda: load_page_matches(URL_UPCOMING), swr=True)
             cache.prune()
         except asyncio.CancelledError:
             raise
@@ -663,7 +706,7 @@ Status = Literal["all", "live", "recent", "upcoming"]
 
 
 @app.get("/health")
-async def health() -> Dict[str, str]:
+async def health() -> Dict[str, Any]:
     return {"status": "ok", "timestamp": now_iso(), "upstream_paused": bool(_state.get("upstream_blocked"))}
 
 
@@ -698,7 +741,7 @@ async def scorecard(match_id: str):
         return JSONResponse(status_code=400, content={"success": False, "error": "match_id must be numeric"})
     try:
         data, fetched, stale = await cache.get(
-            f"scorecard:{match_id}", TTL_SCORECARD, lambda: load_scorecard(match_id)
+            f"scorecard:{match_id}", 15 if known_in_play(match_id) else 60, lambda: load_scorecard(match_id), swr=True
         )
     except ScrapeError as exc:
         return error_response(str(exc))
@@ -730,28 +773,19 @@ def only_fields(item, fields):
     return {k: v for k, v in item.items() if k in fields and v != '$undefined'}
 
 async def ext_fetch(path: str, as_json=False):
-    global _ext_last_fetch
-    # All new uncached requests are serialized with a minimum three-second gap.
-    async with _ext_fetch_lock:
-        await asyncio.sleep(max(0, 3 - (time.monotonic() - _ext_last_fetch)))
-        _ext_last_fetch = time.monotonic()
-        if _state.get('upstream_blocked'):
-            raise ScrapeError('Source refresh paused after a block')
-        response = await _state['client'].get(BASE + path, headers=browser_headers())
-        if response.status_code in (403, 429):
-            _state['upstream_blocked'] = True
-            raise ScrapeError('Source refresh paused after a block')
-        if response.status_code != 200:
-            raise ScrapeError('Source not available')
-        return response.json() if as_json else response.text
+    response = await upstream_get(BASE + path)
+    return response.json() if as_json else response.text
 
 async def ext_text(path):
     return flight_text(await ext_fetch(path))
 
 async def ext_response(key, loader, ttl=EXT_TTL):
+    touch()
+    if key.startswith(('balls:', 'match-details:')):
+        ttl = 15 if known_in_play(key.split(':')[1]) else 60
     try:
-        data, fetched, stale = await cache.get('ext:' + key, ttl, loader)
-        return JSONResponse(content={'success': True, 'stale': stale, 'last_updated': iso(fetched), **data})
+        data, fetched, stale = await cache.get('ext:' + key, ttl, loader, swr=True)
+        return JSONResponse(content={'success': True, 'stale': stale, 'last_updated': iso(fetched), 'updating': stale and not bool(_state.get('upstream_blocked')), 'upstream_paused': bool(_state.get('upstream_blocked')), **data})
     except Exception as exc:
         log.warning('extension source unavailable %s: %s', key, exc)
         return JSONResponse(status_code=503, content={'success': False, 'stale': False, 'error': 'Cricket data is not available from the source right now. Try again later.'})
