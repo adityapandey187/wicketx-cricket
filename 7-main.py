@@ -466,6 +466,8 @@ def build_current_state(mini: Dict[str, Any]) -> Dict[str, Any]:
         "batsmen": batsmen,
         "bowler": bowler,
         "recent_balls": parse_recent_balls(mini.get("recentOvsStats")),
+        "innings_id": mini.get("inningsId"),
+        "partnership": only_fields(mini.get("partnerShip") or {}, {"runs", "balls"}) or None,
         "last_wicket": mini.get("lastWicket") if mini.get("lastWicket") not in (None, "$undefined") else None,
     }
 
@@ -951,7 +953,7 @@ async def load_extended_match(match_id):
         innings=[r for r in ((mini or {}).get('matchScoreDetails') or {}).get('inningsScoreList',[]) if r.get('batTeamId')==tid]
         scores['team'+str(index+1)+'Score']={'inngs'+str(n+1):{'runs':r.get('score'),'wickets':r.get('wickets'),'overs':r.get('overs'),'isDeclared':r.get('isDeclared')} for n,r in enumerate(sorted(innings,key=lambda r:r.get('inningsId',0)))}
     match=build_match({'info':info,'score':scores});match['series_id']=str(header.get('seriesId') or '')
-    return {'match_id':match_id,'match':match,'series_id':str(header.get('seriesId') or ''),'series':header.get('seriesName'),'status_text':header.get('status'),'current_state':build_current_state(mini) if isinstance(mini,dict) else None,'teams':[only_fields(header.get(k) or {},{'id','name','shortName'}) for k in ['team1','team2']]}
+    return {'match_id':match_id,'match':match,'series_id':str(header.get('seriesId') or ''),'series':header.get('seriesName'),'status_text':header.get('status'),'current_state':build_current_state(mini) if isinstance(mini,dict) else None,'match_info': {'description':header.get('matchDescription'),'type':header.get('matchType'),'toss':only_fields(header.get('tossResults') or {},{'tossWinnerName','decision'}),'venue':only_fields(header.get('venue') or {},{'name','city','country','timezone'}),'officials':{key: (value.get('name') if isinstance(value,dict) else value) for key,value in header.items() if key in {'umpire1','umpire2','umpire3','referee'} and value not in (None,'$undefined')},'player_of_match':[row.get('name') for row in header.get('playersOfTheMatch',[]) if row.get('name')],'start_time':info.get('startDate')},'teams':[only_fields(header.get(k) or {},{'id','name','shortName'}) for k in ['team1','team2']]}
 
 @app.get('/api/match/{match_id}/details')
 async def extended_match(match_id:str):
