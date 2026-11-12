@@ -76,6 +76,28 @@ def num_str(v: Any) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 # Async TTL cache with stale fallback, request coalescing and backoff
 # --------------------------------------------------------------------------- #
+def normalize_cumulative_overs(value: Any) -> Any:
+    """Format six completed legal balls as the next whole over.
+
+    Delivery labels (ball), wicket positions (over), and ball counts are not
+    cumulative-overs fields and deliberately remain unchanged.
+    """
+    if isinstance(value, list):
+        return [normalize_cumulative_overs(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in {"overs", "bowlOvs", "overNum"} and isinstance(item, (str, int, float)) and not isinstance(item, bool):
+            completed = re.fullmatch(r"(\d+)\.6(?:0*)", str(item).strip())
+            if completed:
+                whole = int(completed.group(1)) + 1
+                result[key] = str(whole) if isinstance(item, str) else whole
+                continue
+        result[key] = normalize_cumulative_overs(item)
+    return result
+
+
 class TTLCache:
     def __init__(self) -> None:
         self._data: Dict[str, Tuple[float, Any]] = {}
@@ -647,7 +669,7 @@ async def matches_response(category: str, status: str, details: bool) -> JSONRes
         "stale": stale,
         "total": len(selected),
         "last_updated": iso(fetched),
-        "matches": selected,
+        "matches": normalize_cumulative_overs(selected),
         "updating": stale and not bool(_state.get("upstream_blocked")),
         "upstream_paused": bool(_state.get("upstream_blocked")),
         "live_cache_seconds": live_page_ttl(),
@@ -745,7 +767,7 @@ async def scorecard(match_id: str):
         )
     except ScrapeError as exc:
         return error_response(str(exc))
-    return JSONResponse(content={"success": True, "stale": stale, "last_updated": iso(fetched), **data})
+    return JSONResponse(content={"success": True, "stale": stale, "last_updated": iso(fetched), **normalize_cumulative_overs(data)})
 
 
 
@@ -785,7 +807,7 @@ async def ext_response(key, loader, ttl=EXT_TTL):
         ttl = 15 if known_in_play(key.split(':')[1]) else 60
     try:
         data, fetched, stale = await cache.get('ext:' + key, ttl, loader, swr=True)
-        return JSONResponse(content={'success': True, 'stale': stale, 'last_updated': iso(fetched), 'updating': stale and not bool(_state.get('upstream_blocked')), 'upstream_paused': bool(_state.get('upstream_blocked')), **data})
+        return JSONResponse(content={'success': True, 'stale': stale, 'last_updated': iso(fetched), 'updating': stale and not bool(_state.get('upstream_blocked')), 'upstream_paused': bool(_state.get('upstream_blocked')), **normalize_cumulative_overs(data)})
     except Exception as exc:
         log.warning('extension source unavailable %s: %s', key, exc)
         return JSONResponse(status_code=503, content={'success': False, 'stale': False, 'error': 'Cricket data is not available from the source right now. Try again later.'})
