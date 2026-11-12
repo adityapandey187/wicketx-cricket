@@ -105,6 +105,7 @@ class TTLCache:
         self._fail_count: Dict[str, int] = {}
         self._retry_after: Dict[str, float] = {}
         self._refresh_tasks = {}
+        self.max_keys = 512
 
     def _lock(self, key: str) -> asyncio.Lock:
         if key not in self._locks:
@@ -122,6 +123,10 @@ class TTLCache:
         self, key: str, ttl: float, loader: Callable[[], Awaitable[Any]], swr: bool = False
     ) -> Tuple[Any, float, bool]:
         """Return (value, fetched_at, stale). Raises ScrapeError only if nothing is cached."""
+        if key not in self._locks and len(self._locks) >= self.max_keys:
+            self.prune()
+            if len(self._locks) >= self.max_keys:
+                raise ScrapeError("Server is busy. Please try again later.")
         item = self._data.get(key)
         if item and (time.time() - item[0]) < ttl:
             return item[1], item[0], False
@@ -164,8 +169,18 @@ class TTLCache:
 
     def prune(self, max_age: float = 3600) -> None:
         cutoff = time.time() - max_age
-        for k in [k for k, (t, _) in self._data.items() if t < cutoff]:
-            self._data.pop(k, None)
+        for k in list(self._locks):
+            lock = self._locks[k]
+            # Never remove a lock with a loader/waiter or background refresh.
+            if lock.locked() or getattr(lock, "_waiters", None) or k in self._refresh_tasks:
+                continue
+            item = self._data.get(k)
+            if item and item[0] >= cutoff:
+                continue
+            if self._retry_after.get(k, 0) > time.time():
+                continue
+            for mapping in (self._data, self._locks, self._fail_count, self._retry_after):
+                mapping.pop(k, None)
 
 
 cache = TTLCache()
@@ -721,9 +736,17 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def safety_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
 
 Category = Literal["all", "international", "league", "domestic", "women"]
 Status = Literal["all", "live", "recent", "upcoming"]
