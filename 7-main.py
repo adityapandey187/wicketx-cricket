@@ -456,7 +456,7 @@ def parse_recent_balls(s: Optional[str]) -> List[str]:
 
 def build_current_state(mini: Dict[str, Any]) -> Dict[str, Any]:
     def bat(b: Optional[Dict[str, Any]], strike: bool) -> Optional[Dict[str, Any]]:
-        if not b:
+        if not b or not (b.get("name") or b.get("batName")):
             return None
         def pick(*keys):
             for key in keys:
@@ -471,7 +471,7 @@ def build_current_state(mini: Dict[str, Any]) -> Dict[str, Any]:
     batsmen = [x for x in (bat(mini.get("batsmanStriker"), True), bat(mini.get("batsmanNonStriker"), False)) if x]
     bw = mini.get("bowlerStriker")
     bowler = None
-    if bw:
+    if bw and (bw.get("name") or bw.get("bowlName")):
         def pickb(*keys):
             for key in keys:
                 if bw.get(key) is not None:
