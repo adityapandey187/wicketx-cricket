@@ -830,6 +830,8 @@ async def ext_response(key, loader, ttl=EXT_TTL):
     touch()
     if key.startswith(('balls:', 'match-details:')):
         ttl = 15 if known_in_play(key.split(':')[1]) else 60
+    if key.startswith('live:'):
+        ttl = 10 if known_in_play(key.split(':')[1]) else 60
     try:
         data, fetched, stale = await cache.get('ext:' + key, ttl, loader, swr=True)
         return JSONResponse(content={'success': True, 'stale': stale, 'last_updated': iso(fetched), 'updating': stale and not bool(_state.get('upstream_blocked')), 'upstream_paused': bool(_state.get('upstream_blocked')), **normalize_cumulative_overs(data)})
@@ -955,6 +957,25 @@ async def load_ball_facts(match_id,innings):
     if str(data.get('matchId'))!=match_id:
         raise ScrapeError('Wrong match returned')
     return parse_ball_facts(data,match_id,innings)
+
+async def load_live_snapshot(match_id,innings):
+    data=await ext_fetch(f'/api/mcenter/{match_id}/full-commentary/{innings}',True)
+    if str(data.get('matchId'))!=match_id:
+        raise ScrapeError('Wrong match returned')
+    details=data.get('matchDetails') or {}
+    header=details.get('matchHeader') or {}
+    mini=details.get('miniscore')
+    out=parse_ball_facts(data,match_id,innings)
+    out['status_text']=header.get('status')
+    out['current_state']=build_current_state(mini) if isinstance(mini,dict) else None
+    out['match_info']={'description':header.get('matchDescription'),'type':header.get('matchType'),'toss':only_fields(header.get('tossResults') or {},{'tossWinnerName','decision'}),'venue':only_fields(header.get('venue') or {},{'name','city','country','timezone'}),'start_time':header.get('matchStartTimestamp')}
+    return out
+
+@app.get('/api/match/{match_id}/live')
+async def live_snapshot(match_id:str,innings:int=Query(1,ge=1,le=4)):
+    if not numeric(match_id):
+        return JSONResponse(status_code=400,content={'success':False,'error':'Invalid match ID'})
+    return await ext_response(f'live:{match_id}:{innings}',lambda:load_live_snapshot(match_id,innings),60)
 
 @app.get('/api/match/{match_id}/balls')
 async def extended_balls(match_id:str,innings:int=Query(1,ge=1,le=4)):
