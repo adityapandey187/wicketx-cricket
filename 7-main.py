@@ -458,18 +458,28 @@ def build_current_state(mini: Dict[str, Any]) -> Dict[str, Any]:
     def bat(b: Optional[Dict[str, Any]], strike: bool) -> Optional[Dict[str, Any]]:
         if not b:
             return None
+        def pick(*keys):
+            for key in keys:
+                if b.get(key) is not None:
+                    return b.get(key)
+            return None
         return {
-            "name": b.get("name"), "runs": num_str(b.get("runs")), "balls": num_str(b.get("balls")),
-            "fours": num_str(b.get("fours")), "sixes": num_str(b.get("sixes")), "is_strike": strike,
+            "name": pick("name", "batName"), "runs": num_str(pick("runs", "batRuns")), "balls": num_str(pick("balls", "batBalls")),
+            "fours": num_str(pick("fours", "batFours")), "sixes": num_str(pick("sixes", "batSixes")), "is_strike": strike,
         }
 
     batsmen = [x for x in (bat(mini.get("batsmanStriker"), True), bat(mini.get("batsmanNonStriker"), False)) if x]
     bw = mini.get("bowlerStriker")
     bowler = None
     if bw:
+        def pickb(*keys):
+            for key in keys:
+                if bw.get(key) is not None:
+                    return bw.get(key)
+            return None
         bowler = {
-            "name": bw.get("name"), "overs": num_str(bw.get("overs")), "maidens": num_str(bw.get("maidens")),
-            "runs": num_str(bw.get("runs")), "wickets": num_str(bw.get("wickets")),
+            "name": pickb("name", "bowlName"), "overs": num_str(pickb("overs", "bowlOvs")), "maidens": num_str(pickb("maidens", "bowlMaidens")),
+            "runs": num_str(pickb("runs", "bowlRuns")), "wickets": num_str(pickb("wickets", "bowlWkts")),
         }
     crr = mini.get("currentRunRate")
     rrr = mini.get("requiredRunRate")
@@ -485,6 +495,20 @@ def build_current_state(mini: Dict[str, Any]) -> Dict[str, Any]:
         "partnership": only_fields(mini.get("partnerShip") or {}, {"runs", "balls"}) or None,
         "last_wicket": mini.get("lastWicket") if mini.get("lastWicket") not in (None, "$undefined") else None,
     }
+
+
+def live_status_text(header: Dict[str, Any], mini: Optional[Dict[str, Any]]) -> Optional[str]:
+    innings_list = (((mini or {}).get("matchScoreDetails") or {}).get("inningsScoreList") or [])
+    if innings_list:
+        latest = max(innings_list, key=lambda row: row.get("inningsId", 0))
+        team = latest.get("batTeamName") or latest.get("batTeamSName")
+        score = latest.get("score")
+        if team and score is not None:
+            text = f"{team} {score}/{latest.get('wickets', 0)}"
+            if latest.get("overs") is not None:
+                text += f" ({latest['overs']})"
+            return text
+    return header.get("status")
 
 
 def seq_values(d: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -966,7 +990,7 @@ async def load_live_snapshot(match_id,innings):
     header=details.get('matchHeader') or {}
     mini=details.get('miniscore')
     out=parse_ball_facts(data,match_id,innings)
-    out['status_text']=header.get('status')
+    out['status_text']=live_status_text(header,mini)
     out['current_state']=build_current_state(mini) if isinstance(mini,dict) else None
     out['match_info']={'description':header.get('matchDescription'),'type':header.get('matchType'),'toss':only_fields(header.get('tossResults') or {},{'tossWinnerName','decision'}),'venue':only_fields(header.get('venue') or {},{'name','city','country','timezone'}),'start_time':header.get('matchStartTimestamp')}
     return out
