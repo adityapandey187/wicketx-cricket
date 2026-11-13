@@ -1001,6 +1001,186 @@ async def live_snapshot(match_id:str,innings:int=Query(1,ge=1,le=4)):
         return JSONResponse(status_code=400,content={'success':False,'error':'Invalid match ID'})
     return await ext_response(f'live:{match_id}:{innings}',lambda:load_live_snapshot(match_id,innings),60)
 
+
+COMMENTARY_PAGE = 60
+
+
+def commentary_event(ball: Dict[str, Any]) -> str:
+    if ball.get('wicket'):
+        return 'WICKET'
+    if ball.get('six'):
+        return 'SIX'
+    if ball.get('four'):
+        return 'FOUR'
+    runs = int(ball.get('runs') or 0)
+    bat_runs = ball.get('bat_runs')
+    if bat_runs is not None and int(bat_runs or 0) == 0 and runs > 0:
+        return 'EXTRA'
+    if runs == 0:
+        return 'DOT'
+    return 'RUN'
+
+
+def commentary_headline(ball: Dict[str, Any]) -> str:
+    bowler = ball.get('bowler') or 'the bowler'
+    bat = ball.get('batsman') or 'the batter'
+    event = commentary_event(ball)
+    runs = int(ball.get('runs') or 0)
+    if event == 'WICKET':
+        return f'{bowler} to {bat}, OUT!'
+    if event in ('FOUR', 'SIX'):
+        return f'{bowler} to {bat}, {event}!'
+    if event == 'DOT':
+        return f'{bowler} to {bat}, no run.'
+    if event == 'EXTRA':
+        return f'{bowler} to {bat}, {runs} extra run' + ('s.' if runs != 1 else '.')
+    return f'{bowler} to {bat}, {runs} run' + ('s.' if runs != 1 else '.')
+
+
+def commentary_text(ball: Dict[str, Any]) -> str:
+    # Original generated lines from ball facts only; never copied source prose.
+    event = commentary_event(ball)
+    bowler = ball.get('bowler') or 'the bowler'
+    bat = ball.get('batsman') or 'the batter'
+    n = int(ball.get('ball_number') or 0)
+    stats = ball.get('batsman_stats') or {}
+    if event == 'WICKET':
+        made = ''
+        if stats.get('batRuns') is not None:
+            made = f" {bat} made {stats['batRuns']}" + (f" ({stats['batBalls']} balls)." if stats.get('batBalls') is not None else '.')
+        pool = [f'{bowler} breaks through and {bat} has to walk back.',
+                f'{bowler} wins that battle, {bat} departs.']
+        return pool[n % len(pool)] + made
+    pools = {
+        'FOUR': [f'{bat} finds the gap and the ball races away to the rope.',
+                 f'Clean contact from {bat} and it speeds to the boundary.',
+                 f'{bat} places it beyond the field, four runs.'],
+        'SIX': [f'{bat} launches it high over the rope for a maximum.',
+                f'Huge hit from {bat}, that sailed all the way.',
+                f'{bat} swings freely and clears the boundary.'],
+        'DOT': [f'{bat} cannot get {bowler} away this time.',
+                f'Tidy ball from {bowler}, {bat} keeps it out.'],
+        'EXTRA': ['Extra runs added to the total.'],
+    }
+    if event == 'RUN':
+        runs = int(ball.get('runs') or 0)
+        return f'{bat} works it away for a single.' if runs == 1 else f'{bat} comes back for {runs} runs.'
+    pool = pools.get(event) or []
+    return pool[n % len(pool)] if pool else ''
+
+
+def build_commentary_payload(data: Dict[str, Any], match_id: str, innings: int) -> Dict[str, Any]:
+    details = data.get('matchDetails') or {}
+    header = details.get('matchHeader') or {}
+    mini = details.get('miniscore')
+    facts = parse_ball_facts(data, match_id, innings)
+    balls = facts.get('balls') or []
+    items = []
+    by_over = {}
+    for ball in balls:
+        over_key = str(ball.get('ball') or '').split('.')[0]
+        by_over.setdefault(over_key, []).append(ball)
+    for ball in balls:
+        event = commentary_event(ball)
+        over_label = str(ball.get('ball') or '')
+        item = dict(ball)
+        item['type'] = 'ball'
+        item['ball_id'] = f"{innings}_{over_label.replace('.', '_')}"
+        item['over'] = over_label
+        item['event'] = event
+        item['runs'] = int(ball.get('runs') or 0)
+        item['badge_text'] = 'W' if event == 'WICKET' else str(item['runs'])
+        item['headline'] = commentary_headline(ball)
+        item['text'] = commentary_text(ball)
+        items.append(item)
+        summary = ball.get('over_summary') or {}
+        if summary.get('overNum') is not None:
+            over_no = int(summary['overNum'])
+            over_balls = by_over.get(str(over_no - 1), [])
+            labels = ['W' if b.get('wicket') else str(int(b.get('runs') or 0)) for b in reversed(over_balls)]
+            team = ball.get('team') or ''
+            items.append({
+                'type': 'over_summary',
+                'ball_id': f'{innings}_over_{over_no}',
+                'timestamp': (ball.get('timestamp') or 0) + 1,
+                'over_number': over_no,
+                'runs_in_over': int(summary.get('runs') or 0),
+                'total_score': f"{team} {summary.get('score')}/{summary.get('wickets')}",
+                'over_balls': labels,
+                'summary_text': f"Over {over_no}: {int(summary.get('runs') or 0)} runs, {team} {summary.get('score')}/{summary.get('wickets')}.",
+            })
+    items.sort(key=lambda it: (it.get('timestamp') or 0), reverse=True)
+
+    current = build_current_state(mini) if isinstance(mini, dict) else None
+    innings_rows = (((mini or {}).get('matchScoreDetails') or {}).get('inningsScoreList') or [])
+    latest = max(innings_rows, key=lambda row: row.get('inningsId', 0)) if innings_rows else {}
+    partnership = (current or {}).get('partnership') or {}
+    miniscore = {
+        'batting_team': latest.get('batTeamName'),
+        'score': f"{latest.get('score')}/{latest.get('wickets')}" if latest.get('score') is not None else None,
+        'overs': str(latest.get('overs')) if latest.get('overs') is not None else None,
+        'crr': (current or {}).get('crr'),
+        'rrr': (current or {}).get('rrr'),
+        'target': (current or {}).get('target'),
+        'partnership': f"{partnership.get('runs')} ({partnership.get('balls')})" if partnership.get('runs') is not None else None,
+        'last_wicket': (current or {}).get('last_wicket'),
+        'recent_overs_strip': (current or {}).get('recent_balls') or [],
+    }
+    match_info = {'description': header.get('matchDescription'), 'type': header.get('matchType'), 'toss': only_fields(header.get('tossResults') or {}, {'tossWinnerName', 'decision'}), 'venue': only_fields(header.get('venue') or {}, {'name', 'city', 'country', 'timezone'}), 'start_time': header.get('matchStartTimestamp')}
+
+    notes = []
+    toss = match_info.get('toss') or {}
+    if toss.get('tossWinnerName') and toss.get('decision'):
+        decision = str(toss['decision']).strip().lower()
+        decision = {'bowling': 'bowl', 'batting': 'bat'}.get(decision, decision)
+        notes.append({'type': 'milestone_or_note', 'ball_id': f'{innings}_note_toss', 'timestamp': int(time.time() * 1000), 'text': f"{toss['tossWinnerName']} won the toss and elected to {decision}."})
+    target = (current or {}).get('target')
+    if target and latest.get('score') is not None and latest.get('overs') is not None:
+        limits = {'ODI': 50, 'T20': 20, 'T20I': 20}
+        limit = limits.get(str(header.get('matchFormat') or '').upper())
+        try:
+            ov = str(latest['overs'])
+            big, _, small = ov.partition('.')
+            bowled = int(big) * 6 + int(small or 0)
+            needed = int(target) - int(latest['score']) + 1
+            if limit and 0 < needed and bowled < limit * 6:
+                notes.append({'type': 'milestone_or_note', 'ball_id': f'{innings}_note_chase', 'timestamp': int(time.time() * 1000) - 1, 'text': f"{latest.get('batTeamName')} need {needed} runs from {limit * 6 - bowled} balls."})
+        except (TypeError, ValueError):
+            pass
+
+    return {'match_id': match_id, 'innings': innings, 'balls': balls, 'commentary_items': items, 'notes': notes, 'miniscore': miniscore, 'current_state': current, 'status_text': live_status_text(header, mini), 'match_info': match_info}
+
+
+async def load_commentary(match_id, innings):
+    data = await ext_fetch(f'/api/mcenter/{match_id}/full-commentary/{innings}', True)
+    if str(data.get('matchId')) != match_id:
+        raise ScrapeError('Wrong match returned')
+    return build_commentary_payload(data, match_id, innings)
+
+
+@app.get('/api/match/{match_id}/commentary')
+async def match_commentary(match_id: str, innings: int = Query(1, ge=1, le=4), last_timestamp: Optional[int] = Query(None)):
+    if not numeric(match_id):
+        return JSONResponse(status_code=400, content={'success': False, 'error': 'Invalid match ID'})
+    touch()
+    ttl = 12 if known_in_play(match_id) else 60
+    try:
+        data, fetched, stale = await cache.get(f'ext:commentary:{match_id}:{innings}', ttl, lambda: load_commentary(match_id, innings), swr=True)
+    except Exception as exc:
+        log.warning('extension source unavailable commentary:%s: %s', match_id, exc)
+        return JSONResponse(status_code=503, content={'success': False, 'stale': False, 'error': 'Cricket data is not available from the source right now. Try again later.'})
+    items = data['commentary_items']
+    notes = []
+    if last_timestamp is not None:
+        items = [it for it in items if (it.get('timestamp') or 0) < last_timestamp]
+    else:
+        notes = data['notes']
+    page = items[:COMMENTARY_PAGE]
+    next_ts = min(((it.get('timestamp') or 0) for it in page), default=None)
+    has_more = bool(next_ts) and any((it.get('timestamp') or 0) < next_ts for it in items)
+    return JSONResponse(content={'success': True, 'stale': stale, 'last_updated': iso(fetched), 'updating': stale and not bool(_state.get('upstream_blocked')), 'upstream_paused': bool(_state.get('upstream_blocked')), 'match_id': match_id, 'innings': innings, 'miniscore': data['miniscore'], 'current_state': data['current_state'], 'status_text': data['status_text'], 'match_info': data['match_info'], 'commentary_items': notes + page, 'has_more': has_more, 'next_timestamp': next_ts})
+
+
 @app.get('/api/match/{match_id}/balls')
 async def extended_balls(match_id:str,innings:int=Query(1,ge=1,le=4)):
     if not numeric(match_id):
