@@ -2,13 +2,16 @@ name: Keep API warm
 on:
   schedule:
     # Every 15 min, 04:00-18:59 UTC (~9:30 AM - 12:30 AM IST, cricket hours).
-    # Render free API sleeps after 15 min idle; this keeps it warm while
-    # staying under the private repo's 2,000 free Actions minutes/month.
+    # GitHub throttles frequent cron on free repos, so in practice this fires
+    # only a few times a day; it is a supplement, not guaranteed warmth.
+    # Render free API sleeps after 15 min idle.
     - cron: '*/15 4-18 * * *'
   workflow_dispatch:
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping API health
-        run: curl -fsS --max-time 120 https://wicketx-cricket-api.onrender.com/health
+      - name: Ping API health and matches feed
+        run: |
+          curl -fsS --max-time 60 --retry 3 --retry-delay 10 --retry-all-errors https://wicketx-cricket-api.onrender.com/health
+          curl -fsS --max-time 90 --retry 3 --retry-delay 10 --retry-all-errors 'https://wicketx-cricket-api.onrender.com/api/matches?details=false' -o /dev/null
