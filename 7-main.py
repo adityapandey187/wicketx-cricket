@@ -631,7 +631,7 @@ def sort_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 # Service layer
 # --------------------------------------------------------------------------- #
-async def get_all_matches() -> Tuple[List[Dict[str, Any]], float, bool]:
+async def get_all_matches() -> Tuple[List[Dict[str, Any]], float, bool, Dict[str, Any]]:
     """Merge live page (15s TTL) with recent/upcoming pages (5 min TTL)."""
     results = await asyncio.gather(
         cache.get("page:live", live_page_ttl(), lambda: load_page_matches(URL_LIVE), swr=True),
@@ -651,7 +651,16 @@ async def get_all_matches() -> Tuple[List[Dict[str, Any]], float, bool]:
             merged[m["id"]] = dict(m)
     stale = any(r[2] for r in good) or len(good) < len(results)
     fetched = results[0][1] if not isinstance(results[0], BaseException) else min(r[1] for r in good)
-    return list(merged.values()), fetched, stale
+    feeds = {}
+    for name, result in zip(("live", "recent", "upcoming"), results):
+        if isinstance(result, BaseException):
+            feeds[name] = {"status": "unavailable", "last_fetched_at": None}
+        else:
+            feeds[name] = {
+                "status": "stale" if result[2] else "fresh",
+                "last_fetched_at": iso(result[1]),
+            }
+    return list(merged.values()), fetched, stale, feeds
 
 
 async def enrich_live(matches: List[Dict[str, Any]]) -> bool:
@@ -697,7 +706,7 @@ def error_response(msg: str) -> JSONResponse:
 async def matches_response(category: str, status: str, details: bool) -> JSONResponse:
     touch()
     try:
-        matches, fetched, stale = await get_all_matches()
+        matches, fetched, stale, feeds = await get_all_matches()
     except ScrapeError as exc:
         return error_response(str(exc))
     selected = sort_matches(filter_matches(matches, category, status))
@@ -709,6 +718,7 @@ async def matches_response(category: str, status: str, details: bool) -> JSONRes
         "success": True,
         "stale": stale,
         "total": len(selected),
+        "feeds": feeds,
         "last_updated": iso(fetched),
         "matches": normalize_cumulative_overs(selected),
         "updating": stale and not bool(_state.get("upstream_blocked")),
